@@ -1,13 +1,11 @@
 import * as crypto from 'crypto';
 
-// Definición de una cuenta: saldo, clave privada, clave pública
 interface Account {
     balance: number;
     privateKey: string;
     publicKey: string;
 }
 
-// Clase que representa una transacción
 class Transaction {
     from: string;
     to: string;
@@ -27,7 +25,6 @@ class Transaction {
         this.signature = signature;
     }
 
-    // Calcula el hash de la transacción
     calculateHash(): string {
         return crypto.createHash('sha256').update(
             this.from + this.to + this.value + this.fee + this.timestamp + this.nonce
@@ -35,7 +32,6 @@ class Transaction {
     }
 }
 
-// Clase que representa un bloque de la blockchain
 class Block {
     prevHash: string;
     transactions: Transaction[];
@@ -52,7 +48,6 @@ class Block {
         this.hash = this.calculateHash();
     }
 
-    // Calcula el hash del bloque
     calculateHash(): string {
         return crypto.createHash('sha256').update(
             this.prevHash + JSON.stringify(this.transactions) + this.timestamp + this.nonce
@@ -60,7 +55,6 @@ class Block {
     }
 }
 
-// Clase principal que representa la blockchain
 class Blockchain {
     chain: Block[];
     pendingTransactions: Transaction[];
@@ -68,13 +62,14 @@ class Blockchain {
     nodePrivateKey: string;
     nodePublicKey: string;
     aesKey: Buffer;
+    usedNonces: Set<number>;
 
     constructor(aesKey: Buffer) {
         this.chain = [this.createGenesisBlock()];
         this.pendingTransactions = [];
         this.accounts = {};
+        this.usedNonces = new Set();
 
-        // Generar las claves del nodo minero
         const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
             modulusLength: 2048,
             publicKeyEncoding: { type: 'pkcs1', format: 'pem' },
@@ -85,28 +80,23 @@ class Blockchain {
         this.aesKey = aesKey;
     }
 
-    // Crea el bloque génesis (primer bloque de la cadena)
     createGenesisBlock(): Block {
         return new Block('0', [], Date.now());
     }
 
-    // Obtiene el último bloque de la cadena
     getLatestBlock(): Block {
         return this.chain[this.chain.length - 1];
     }
 
-    // Crea una cuenta con claves y saldo inicial
     createAccount(address: string, balance: number): void {
         const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', {
             modulusLength: 2048,
             publicKeyEncoding: { type: 'pkcs1', format: 'pem' },
             privateKeyEncoding: { type: 'pkcs1', format: 'pem' }
         });
-
         this.accounts[address] = { balance, privateKey, publicKey };
     }
 
-    // Añade una transacción pendiente (previa validación)
     addTransaction(transaction: Transaction): void {
         if (!transaction.from || !transaction.to) {
             throw new Error('Transaction must include from and to address.');
@@ -121,7 +111,10 @@ class Blockchain {
             throw new Error(`Not enough balance in ${transaction.from}.`);
         }
 
-        // Verificar la firma de la transacción
+        if (this.usedNonces.has(transaction.nonce)) {
+            throw new Error(`Nonce ${transaction.nonce} has already been used.`);
+        }
+
         const verify = crypto.createVerify('SHA256');
         verify.update(transaction.from + transaction.to + transaction.value + transaction.fee + transaction.timestamp + transaction.nonce);
         verify.end();
@@ -132,13 +125,19 @@ class Blockchain {
         }
 
         this.pendingTransactions.push(transaction);
+        this.usedNonces.add(transaction.nonce);
     }
 
-    // Mina las transacciones pendientes, crea y firma un bloque
     minePendingTransactions(): Block {
-        const block = new Block(this.getLatestBlock().hash, this.pendingTransactions, Date.now());
+        const blockTimestamp = Date.now();
+        for (const tx of this.pendingTransactions) {
+            if (tx.timestamp > blockTimestamp) {
+                throw new Error(`Transaction timestamp ${tx.timestamp} is after block timestamp ${blockTimestamp}.`);
+            }
+        }
 
-        // Firma el bloque con la clave privada del nodo
+        const block = new Block(this.getLatestBlock().hash, this.pendingTransactions, blockTimestamp);
+
         const sign = crypto.createSign('SHA256');
         sign.update(block.hash);
         sign.end();
@@ -147,7 +146,6 @@ class Blockchain {
 
         this.chain.push(block);
 
-        // Actualiza los balances de las cuentas
         for (const tx of this.pendingTransactions) {
             this.accounts[tx.from].balance -= (tx.value + tx.fee);
             if (!this.accounts[tx.to]) {
@@ -160,7 +158,6 @@ class Blockchain {
         return block;
     }
 
-    // Verifica la firma del bloque recibido
     verifyBlockSignature(block: Block): boolean {
         const verify = crypto.createVerify('SHA256');
         verify.update(block.hash);
@@ -168,7 +165,6 @@ class Blockchain {
         return verify.verify(this.nodePublicKey, block.minerSignature, 'hex');
     }
 
-    // Cifra un bloque para enviarlo a otro nodo
     encryptBlock(block: Block): string {
         const iv = crypto.randomBytes(16);
         const cipher = crypto.createCipheriv('aes-256-cbc', this.aesKey, iv);
@@ -177,7 +173,6 @@ class Blockchain {
         return iv.toString('hex') + ':' + encrypted;
     }
 
-    // Descifra un bloque recibido cifrado
     decryptBlock(encryptedData: string): Block {
         const [ivHex, encrypted] = encryptedData.split(':');
         const iv = Buffer.from(ivHex, 'hex');
@@ -187,7 +182,6 @@ class Blockchain {
         return JSON.parse(decrypted);
     }
 
-    // Recibe un bloque cifrado, lo descifra, verifica la firma y lo agrega si es válido
     receiveEncryptedBlock(encryptedData: string): void {
         const block = this.decryptBlock(encryptedData);
         const isSignatureValid = this.verifyBlockSignature(block);
@@ -199,25 +193,43 @@ class Blockchain {
         console.log(`Block received and added. Hash: ${block.hash}`);
     }
 
-    // Obtiene el balance de una cuenta
     getBalanceOfAccount(address: string): number {
         return this.accounts[address]?.balance ?? 0;
+    }
+
+    getBalanceAtBlock(address: string, blockIndex: number): number {
+        if (blockIndex >= this.chain.length) {
+            throw new Error(`Block index ${blockIndex} out of range.`);
+        }
+        let balance = this.accounts[address]?.balance ?? 0;
+        for (let i = this.chain.length - 1; i > blockIndex; i--) {
+            const block = this.chain[i];
+            for (const tx of block.transactions) {
+                if (tx.from === address) balance += tx.value + tx.fee;
+                if (tx.to === address) balance -= tx.value;
+            }
+        }
+        return balance;
+    }
+
+    findBlockByHash(hash: string): number | null {
+        for (let i = 0; i < this.chain.length; i++) {
+            if (this.chain[i].hash === hash) {
+                return i;
+            }
+        }
+        return null;
     }
 }
 
 // Programa principal
-
-// Genera una clave AES de 32 bytes compartida entre nodos
 const aesKey = crypto.randomBytes(32);
 
-// Crear nodoA (minero) y nodoB (receptor)
 const nodoA = new Blockchain(aesKey);
 const nodoB = new Blockchain(aesKey);
 
-// Compartir la clave pública del minero (nodoA) con nodoB para verificar bloques
 nodoB.nodePublicKey = nodoA.nodePublicKey;
 
-// Crear 100 cuentas en ambos nodos
 for (let i = 1; i <= 100; i++) {
     const address = `0x${i.toString().padStart(3, '0')}`;
     const balance = Math.floor(Math.random() * 1000) + 1000;
@@ -225,7 +237,6 @@ for (let i = 1; i <= 100; i++) {
     nodoB.createAccount(address, balance);
 }
 
-// Función para generar una transacción aleatoria
 function randomTransaction(blockchain: Blockchain): Transaction {
     const keys = Object.keys(blockchain.accounts);
     const from = keys[Math.floor(Math.random() * keys.length)];
@@ -243,7 +254,6 @@ function randomTransaction(blockchain: Blockchain): Transaction {
 
     const tx = new Transaction(from, to, value, fee, timestamp, nonce);
 
-    // Firmar la transacción
     const sign = crypto.createSign('SHA256');
     sign.update(tx.from + tx.to + tx.value + tx.fee + tx.timestamp + tx.nonce);
     sign.end();
@@ -253,8 +263,7 @@ function randomTransaction(blockchain: Blockchain): Transaction {
     return tx;
 }
 
-// Simular 10 bloques: nodoA mina y envía cifrado a nodoB
-for (let b = 1; b <= 10; b++) {
+for (let b = 1; b <= 100; b++) {
     const txCount = Math.floor(Math.random() * 30) + 1;
     for (let i = 0; i < txCount; i++) {
         try {
@@ -265,13 +274,17 @@ for (let b = 1; b <= 10; b++) {
         }
     }
 
-    const minedBlock = nodoA.minePendingTransactions();
-    const encryptedBlock = nodoA.encryptBlock(minedBlock);
-
-    console.log(`Node A mined block ${b}, sending encrypted block to Node B...`);
-    nodoB.receiveEncryptedBlock(encryptedBlock);
+    try {
+        const minedBlock = nodoA.minePendingTransactions();
+        const encryptedBlock = nodoA.encryptBlock(minedBlock);
+        console.log(`Node A mined block ${b}, sending encrypted block to Node B...`);
+        nodoB.receiveEncryptedBlock(encryptedBlock);
+    } catch (err) {
+        console.log(`Error mining block ${b}: ${(err as Error).message}`);
+    }
 }
 
-// Consultar balance de una cuenta en nodoB
-const sampleAccount = '0x001';
-console.log(`Balance in Node B for ${sampleAccount}:`, nodoB.getBalanceOfAccount(sampleAccount));
+console.log("\nFinal balances in Node B:");
+for (const address in nodoB.accounts) {
+    console.log(`${address}: ${nodoB.getBalanceOfAccount(address)}`);
+}
